@@ -1,0 +1,862 @@
+---
+title: "MIDUS 2 Models: Full-Time, Standard-Shift Sample"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About this script
+
+**Primary, preregistered analysis (main text).** Full-time,
+standard-daytime-shift participants.
+
+Fits Models 1a, 1a + weekend, 1b, 2a, and 2b (raw TV; preregistered),
+plus Model 2b with log1p TV (secondary; not preregistered). Run
+`M2_data_structuring.Rmd` first. Fitted models, LOO, and k-fold objects
+are cached in `model_fits_m2/fulltime_standard/`, so re-knitting reloads
+them instead of refitting.
+
+Robustness checks (not preregistered): 10-fold cross-validation for the
+random-scale model comparisons, because many observations have Pareto
+k > 0.7 even after moment matching; and Model 2b refit with `mi()` to
+include days with sleep but missing TV.
+
+Models with doubled iterations (bulk ESS < 1000 at 2000 iterations,
+per the prereg): `model_2b_log`, `model_2b_mi`.
+
+# Packages, data, and helper functions
+
+```{r}
+library(dplyr)
+library(brms)
+
+M2_sample <- readRDS("M2_analysis_data_fulltime_standard.rds")
+
+model_output_dir <- "model_fits_m2/fulltime_standard"
+dir.create(model_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+tag <- "fulltime_standard"
+
+# Computes LOO once and caches it to disk
+get_loo <- function(model, path) {
+  if (file.exists(path)) {
+    readRDS(path)
+  } else {
+    loo_result <- loo(model, moment_match = TRUE)
+    saveRDS(loo_result, path)
+    loo_result
+  }
+}
+
+# kfold() runs refits through the future package, which by default
+# refuses to pass objects over 500 MB (the fitted models are larger).
+# Folds run one at a time in this session, so nothing is copied.
+options(future.globals.maxSize = Inf)
+
+# Computes 10-fold CV once and caches it to disk (refits are not saved,
+# to keep disk use low)
+get_kfold <- function(model, folds, path) {
+  if (file.exists(path)) {
+    readRDS(path)
+  } else {
+    kfold_result <- kfold(model, folds = folds, seed = 2026)
+    saveRDS(kfold_result, path)
+    kfold_result
+  }
+}
+
+# Assigns K folds stratified by participant: each person's rows are
+# shuffled and dealt across folds in turn, so their days land in different
+# folds. Same algorithm as loo::kfold_split_stratified() in loo >= 2.9.0.
+# Written out because loo 2.8.0 mishandles participants with a single row
+# (sample(n) draws from 1:n), which silently un-stratifies the folds.
+split_folds_by_id <- function(id, K = 10) {
+  id <- as.integer(factor(id))
+  row_order <- integer()
+  for (person in seq_len(max(id))) {
+    rows <- which(id == person)
+    if (length(rows) > 1) rows <- sample(rows)
+    row_order <- c(row_order, rows)
+  }
+  folds <- rep(NA_integer_, length(id))
+  folds[row_order] <- rep(1:K, ceiling(length(id) / K))[seq_along(id)]
+  folds
+}
+
+# Prereg convergence criteria: R-hat < 1.01, bulk and tail ESS > 1000,
+# and 0 divergent transitions (population-level, SD, and correlation
+# parameters; bsp_ and sigma_ cover the mi() model)
+check_convergence <- function(fit) {
+  draws_summary <- posterior::summarise_draws(
+    as_draws_df(fit, variable = "^(b_|bsp_|sd_|cor_|sigma$|sigma_)", regex = TRUE),
+    "rhat", "ess_bulk", "ess_tail"
+  )
+
+  tibble(
+    max_rhat = max(draws_summary$rhat, na.rm = TRUE),
+    min_bulk_ess = min(draws_summary$ess_bulk, na.rm = TRUE),
+    min_tail_ess = min(draws_summary$ess_tail, na.rm = TRUE),
+    divergent = sum(nuts_params(fit, pars = "divergent__")$Value)
+  ) %>%
+    mutate(
+      meets_prereg = max_rhat < 1.01 & min_bulk_ess > 1000 &
+        min_tail_ess > 1000 & divergent == 0
+    )
+}
+
+# Prereg assumption check: Q-Q plot of level-1 residuals
+check_residual_normality <- function(fit, label) {
+  resid_est <- residuals(
+    fit,
+    method = "posterior_predict"
+  )[, "Estimate"]
+
+  qqnorm(
+    resid_est,
+    main = paste0(label, ": Level-1 residual Q-Q plot")
+  )
+
+  qqline(resid_est)
+}
+```
+
+# Descriptive statistics
+
+Sleep, TV, and weekend are summarized at the diary-day level; age and sex
+at the participant level.
+
+```{r}
+# Outcome and TV predictors (diary-day level)
+M2_sample %>%
+  summarise(
+    sleep_mean = mean(sleep_next_night_minutes, na.rm = TRUE),
+    sleep_sd = sd(sleep_next_night_minutes, na.rm = TRUE),
+    sleep_min = min(sleep_next_night_minutes, na.rm = TRUE),
+    sleep_max = max(sleep_next_night_minutes, na.rm = TRUE),
+    sleep_missing = sum(is.na(sleep_next_night_minutes)),
+
+    tv_mean = mean(tv_duration_minutes, na.rm = TRUE),
+    tv_sd = sd(tv_duration_minutes, na.rm = TRUE),
+    tv_min = min(tv_duration_minutes, na.rm = TRUE),
+    tv_max = max(tv_duration_minutes, na.rm = TRUE),
+    tv_missing = sum(is.na(tv_duration_minutes)),
+
+    tv_log_mean = mean(tv_duration_minutes_log, na.rm = TRUE),
+    tv_log_sd = sd(tv_duration_minutes_log, na.rm = TRUE),
+    tv_log_missing = sum(is.na(tv_duration_minutes_log))
+  ) %>%
+  as.data.frame()
+
+# Weekend (diary-day level)
+M2_sample %>%
+  count(weekend)
+
+# Age (participant level)
+M2_sample %>%
+  distinct(id, age) %>%
+  summarise(
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = sd(age, na.rm = TRUE),
+    age_min = min(age, na.rm = TRUE),
+    age_max = max(age, na.rm = TRUE),
+    age_missing = sum(is.na(age))
+  )
+
+# Sex (participant level; 0 = male, 1 = female)
+M2_sample %>%
+  distinct(id, sex) %>%
+  count(sex)
+```
+
+# Sample characteristics
+
+```{r}
+# Analytic sample
+M2_sample %>%
+  summarise(
+    total_rows = n(),
+    participants = n_distinct(id),
+    missing_next_sleep = sum(is.na(sleep_next_night_minutes)),
+    usable_for_model = sum(!is.na(sleep_next_night_minutes)),
+    usable_participants = n_distinct(
+      id[!is.na(sleep_next_night_minutes)]
+    )
+  ) %>%
+  as.data.frame()
+
+# Employment / shift (confirms the sample definition)
+M2_sample %>%
+  distinct(id, is_fulltime, is_standard_shift) %>%
+  summarise(
+    percent_fulltime = mean(is_fulltime == 1) * 100,
+    percent_standard_shift = mean(is_standard_shift == 1) * 100
+  )
+
+# Health conditions (participant level)
+M2_sample %>%
+  distinct(id, head_injury, neurological_disorder, chronic_sleep_problem) %>%
+  summarise(
+    n = n(),
+    head_injury_n = sum(head_injury == 1, na.rm = TRUE),
+    head_injury_percent = mean(head_injury == 1, na.rm = TRUE) * 100,
+    neurological_disorder_n = sum(neurological_disorder == 1, na.rm = TRUE),
+    neurological_disorder_percent = mean(neurological_disorder == 1, na.rm = TRUE) * 100,
+    chronic_sleep_problem_n = sum(chronic_sleep_problem == 1, na.rm = TRUE),
+    chronic_sleep_problem_percent = mean(chronic_sleep_problem == 1, na.rm = TRUE) * 100
+  ) %>%
+  as.data.frame()
+
+# Family structure
+M2_sample %>%
+  distinct(id, M2FAMNUM) %>%
+  count(M2FAMNUM, name = "family_size") %>%
+  summarise(
+    n_families = n(),
+    n_singleton_families = sum(family_size == 1),
+    n_multi_member_families = sum(family_size > 1),
+    max_family_size = max(family_size)
+  )
+
+# Diary compliance: days with an observed next-night sleep report
+M2_sample %>%
+  group_by(id) %>%
+  summarise(diary_days = sum(!is.na(sleep_next_night_minutes))) %>%
+  summarise(
+    mean_diary_days = mean(diary_days),
+    median_diary_days = median(diary_days),
+    min_diary_days = min(diary_days),
+    max_diary_days = max(diary_days)
+  )
+```
+
+# Table 1 descriptives
+
+Values for the manuscript's descriptive table. Printed as data frames
+so they are not rounded.
+
+```{r}
+# Participant level: age, sex, and work schedule during the diary week
+# (work defines the full-time, standard-shift sample)
+M2_sample %>%
+  distinct(id, age, sex, days_worked, total_work_hours) %>%
+  summarise(
+    participants = n(),
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = sd(age, na.rm = TRUE),
+    n_female = sum(sex == 1, na.rm = TRUE),
+    percent_female = mean(sex == 1, na.rm = TRUE) * 100,
+    days_worked_mean = mean(days_worked, na.rm = TRUE),
+    days_worked_sd = sd(days_worked, na.rm = TRUE),
+    work_hours_mean = mean(total_work_hours, na.rm = TRUE),
+    work_hours_sd = sd(total_work_hours, na.rm = TRUE)
+  ) %>%
+  as.data.frame()
+
+# Diary-day level percentages
+M2_sample %>%
+  summarise(
+    rows = n(),
+    n_weekend = sum(weekend == 1, na.rm = TRUE),
+    percent_weekend = mean(weekend == 1, na.rm = TRUE) * 100,
+    n_tv_reported = sum(!is.na(tv_duration_minutes)),
+    n_no_tv_days = sum(tv_duration_minutes == 0, na.rm = TRUE),
+    percent_no_tv_days = mean(tv_duration_minutes == 0, na.rm = TRUE) * 100
+  ) %>%
+  as.data.frame()
+
+# Participants who watched TV on at least one diary day
+M2_sample %>%
+  group_by(id) %>%
+  summarise(any_tv = any(tv_duration_minutes > 0, na.rm = TRUE)) %>%
+  summarise(
+    n_any_tv = sum(any_tv),
+    percent_any_tv = mean(any_tv) * 100
+  ) %>%
+  as.data.frame()
+
+# Sleep and TV: overall M, SD, and median, plus between-person SD
+# (SD of person means) and within-person SD (SD of deviations from
+# each person's own mean)
+describe_levels <- function(data, variable) {
+  data %>%
+    filter(!is.na({{ variable }})) %>%
+    group_by(id) %>%
+    mutate(
+      person_mean = mean({{ variable }}),
+      deviation = {{ variable }} - person_mean
+    ) %>%
+    ungroup() %>%
+    summarise(
+      n = n(),
+      mean = mean({{ variable }}),
+      sd = sd({{ variable }}),
+      median = median({{ variable }}),
+      between_person_sd = sd(person_mean[!duplicated(id)]),
+      within_person_sd = sd(deviation)
+    )
+}
+
+bind_rows(
+  sleep_next_night_minutes = describe_levels(M2_sample, sleep_next_night_minutes),
+  tv_duration_minutes = describe_levels(M2_sample, tv_duration_minutes),
+  .id = "variable"
+) %>%
+  as.data.frame()
+
+# Complete TV-sleep pairs per participant (level-1 sample for Model 2b)
+M2_sample %>%
+  filter(!is.na(tv_duration_minutes), !is.na(sleep_next_night_minutes)) %>%
+  count(id, name = "pairs") %>%
+  summarise(
+    total_pairs = sum(pairs),
+    participants = n(),
+    mean_pairs = mean(pairs),
+    median_pairs = median(pairs),
+    min_pairs = min(pairs),
+    max_pairs = max(pairs)
+  ) %>%
+  as.data.frame()
+```
+
+# Model 1a: unconditional means model
+
+```{r}
+message("Fitting model_1a (", tag, ")")
+model_1a <- brm(
+  sleep_next_night_minutes ~ 1 + (1 | id),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(model_output_dir, paste0("model_1a_", tag, "_m2")),
+  file_refit = "never"
+)
+
+summary(model_1a, prob = 0.9)
+
+# ICC
+variance_components_1a <- VarCorr(model_1a)
+
+between_person_var_1a <- variance_components_1a$id$sd[1, "Estimate"]^2
+residual_var_1a <- variance_components_1a$residual__$sd[1, "Estimate"]^2
+icc_1a <- between_person_var_1a /
+  (between_person_var_1a + residual_var_1a)
+
+fixef(model_1a, probs = c(0.05, 0.95))
+
+between_person_var_1a
+residual_var_1a
+icc_1a
+```
+
+# Model 1a with weekend control
+
+```{r}
+message("Fitting model_weekend (", tag, ")")
+model_weekend <- brm(
+  sleep_next_night_minutes ~ 1 + weekend + (1 | id),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(model_output_dir, paste0("model_weekend_", tag, "_m2")),
+  file_refit = "never"
+)
+
+summary(model_weekend, prob = 0.9)
+
+# ICC
+variance_components_weekend <- VarCorr(model_weekend)
+
+between_person_var_weekend <- variance_components_weekend$id$sd[1, "Estimate"]^2
+residual_var_weekend <- variance_components_weekend$residual__$sd[1, "Estimate"]^2
+icc_weekend <- between_person_var_weekend /
+  (between_person_var_weekend + residual_var_weekend)
+
+fixef(model_weekend, probs = c(0.05, 0.95))
+
+between_person_var_weekend
+residual_var_weekend
+icc_weekend
+```
+
+# Comparing Model 1a and the weekend-control model
+
+The weekend indicator is retained in all later models regardless of this
+comparison (prereg).
+
+```{r}
+loo_1a <- get_loo(model_1a, file.path(model_output_dir, paste0("loo_1a_", tag, "_m2.rds")))
+loo_weekend <- get_loo(model_weekend, file.path(model_output_dir, paste0("loo_weekend_", tag, "_m2.rds")))
+
+loo_compare(list(model_1a = loo_1a, model_weekend = loo_weekend))
+```
+
+# Model 1b: person-specific residual variance (random scale)
+
+`sigma ~ 1 + (1 | q | id)` lets the residual variance differ by person;
+the shared `q` tag estimates the intercept-scale correlation.
+
+```{r}
+message("Fitting model_1b (", tag, ")")
+model_1b <- brm(
+  bf(
+    sleep_next_night_minutes ~ 1 + weekend + (1 | q | id),
+    sigma ~ 1 + (1 | q | id)
+  ),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(model_output_dir, paste0("model_1b_", tag, "_m2")),
+  file_refit = "never"
+)
+
+summary(model_1b, prob = 0.9)
+```
+
+# Comparing the weekend-control model and Model 1b
+
+The better-fitting residual structure is carried forward (prereg).
+
+```{r}
+loo_1b <- get_loo(model_1b, file.path(model_output_dir, paste0("loo_1b_", tag, "_m2.rds")))
+
+loo_compare(list(model_weekend = loo_weekend, model_1b = loo_1b))
+```
+
+# Model 2a: age and sex
+
+Age is mean-centered at the participant level.
+
+```{r}
+age_mean <- M2_sample %>%
+  distinct(id, age) %>%
+  summarise(m = mean(age, na.rm = TRUE)) %>%
+  pull(m)
+
+M2_sample <- M2_sample %>%
+  mutate(age_centered = age - age_mean)
+```
+
+```{r}
+message("Fitting model_2a (", tag, ")")
+
+model_2a <- brm(
+  bf(
+    sleep_next_night_minutes ~
+      1 + weekend + age_centered + sex +
+      (1 | q | id),
+
+    sigma ~ 1 + (1 | q | id)
+  ),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(
+    model_output_dir,
+    paste0("model_2a_", tag, "_m2")
+  ),
+  file_refit = "never"
+)
+
+summary(model_2a, prob = 0.9)
+```
+
+# Model 2b: within- and between-person TV (raw minutes; preregistered)
+
+TV is person-mean centered (`tv_within`), and each person's mean is
+grand-mean centered across participants (`tv_person_mean`).
+
+```{r}
+M2_sample <- M2_sample %>%
+  group_by(id) %>%
+  mutate(
+    tv_person_mean_raw = mean(tv_duration_minutes, na.rm = TRUE),
+    tv_within = tv_duration_minutes - tv_person_mean_raw
+  ) %>%
+  ungroup()
+
+# Equally weighted mean of participants' TV means
+tv_grand_mean <- M2_sample %>%
+  distinct(id, tv_person_mean_raw) %>%
+  summarise(
+    grand_mean = mean(tv_person_mean_raw, na.rm = TRUE)
+  ) %>%
+  pull(grand_mean)
+
+M2_sample <- M2_sample %>%
+  mutate(
+    tv_person_mean = tv_person_mean_raw - tv_grand_mean
+  )
+
+# QC: centered person means should average ~0
+tv_grand_mean
+
+M2_sample %>%
+  distinct(id, tv_person_mean_raw, tv_person_mean) %>%
+  summarise(
+    participants = n(),
+    grand_mean_raw = mean(tv_person_mean_raw),
+    grand_mean_centered = mean(tv_person_mean)
+  )
+```
+
+```{r}
+message("Fitting model_2b (", tag, ")")
+
+model_2b <- brm(
+  bf(
+    sleep_next_night_minutes ~
+      1 + weekend + age_centered + sex +
+      tv_within + tv_person_mean +
+      (1 | q | id),
+
+    sigma ~ 1 + (1 | q | id)
+  ),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(
+    model_output_dir,
+    paste0("model_2b_", tag, "_m2")
+  ),
+  file_refit = "never"
+)
+
+summary(model_2b, prob = 0.9)
+```
+
+# Model 2b with log1p TV (secondary; not preregistered)
+
+```{r}
+M2_sample <- M2_sample %>%
+  group_by(id) %>%
+  mutate(
+    tv_log_person_mean_raw = mean(tv_duration_minutes_log, na.rm = TRUE),
+    tv_log_within =
+      tv_duration_minutes_log - tv_log_person_mean_raw
+  ) %>%
+  ungroup()
+
+tv_log_grand_mean <- M2_sample %>%
+  distinct(id, tv_log_person_mean_raw) %>%
+  summarise(
+    grand_mean = mean(tv_log_person_mean_raw, na.rm = TRUE)
+  ) %>%
+  pull(grand_mean)
+
+M2_sample <- M2_sample %>%
+  mutate(
+    tv_log_person_mean =
+      tv_log_person_mean_raw - tv_log_grand_mean
+  )
+
+# QC: centered person means and within-person deviations should average ~0
+M2_sample %>%
+  distinct(id, tv_log_person_mean_raw, tv_log_person_mean) %>%
+  summarise(
+    participants = n(),
+    grand_mean_raw = mean(tv_log_person_mean_raw, na.rm = TRUE),
+    grand_mean_centered = mean(tv_log_person_mean, na.rm = TRUE)
+  )
+
+M2_sample %>%
+  group_by(id) %>%
+  summarise(
+    mean_tv_log_within = mean(tv_log_within, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  summarise(
+    largest_absolute_mean =
+      max(abs(mean_tv_log_within), na.rm = TRUE)
+  )
+```
+
+```{r}
+message("Fitting model_2b_log (", tag, ")")
+
+model_2b_log <- brm(
+  bf(
+    sleep_next_night_minutes ~
+      1 + weekend + age_centered + sex +
+      tv_log_within + tv_log_person_mean +
+      (1 | q | id),
+
+    sigma ~ 1 + (1 | q | id)
+  ),
+  data = M2_sample,
+  family = gaussian(),
+  chains = 4,
+  # Iterations doubled per prereg (bulk ESS < 1000 at 2000 iterations)
+  iter = 4000,
+  warmup = 2000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(
+    model_output_dir,
+    paste0("model_2b_log_", tag, "_m2")
+  ),
+  file_refit = "never"
+)
+
+summary(model_2b_log, prob = 0.9)
+```
+
+# Comparing Model 2a, Model 2b, and Model 2b (log)
+
+`loo_compare()` needs every model fit to the same rows. Models 2b and
+2b-log drop rows with missing TV, so Model 2a is refit on that
+TV-complete subset only for these comparisons. The raw vs. log
+comparison is not preregistered.
+
+```{r}
+M2_sample_tv_complete <- M2_sample %>%
+  filter(!is.na(tv_duration_minutes))
+
+message("Fitting model_2a_tv_complete (", tag, ")")
+
+model_2a_tv_complete <- brm(
+  bf(
+    sleep_next_night_minutes ~
+      1 + weekend + age_centered + sex +
+      (1 | q | id),
+    sigma ~ 1 + (1 | q | id)
+  ),
+  data = M2_sample_tv_complete,
+  family = gaussian(),
+  chains = 4,
+  iter = 2000,
+  warmup = 1000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(
+    model_output_dir,
+    paste0("model_2a_tv_complete_", tag, "_m2")
+  ),
+  file_refit = "never"
+)
+
+# QC: all compared models use the same observations
+stopifnot(
+  nobs(model_2a_tv_complete) == nobs(model_2b),
+  nobs(model_2a_tv_complete) == nobs(model_2b_log)
+)
+```
+
+```{r}
+loo_2a_tv_complete <- get_loo(model_2a_tv_complete, file.path(model_output_dir, paste0("loo_2a_tv_complete_", tag, "_m2.rds")))
+loo_2b <- get_loo(model_2b, file.path(model_output_dir, paste0("loo_2b_", tag, "_m2.rds")))
+loo_2b_log <- get_loo(model_2b_log, file.path(model_output_dir, paste0("loo_2b_log_", tag, "_m2.rds")))
+
+# Pareto k diagnostics (after moment matching). All observations should
+# be below 0.7 for the LOO estimates above to be reliable
+loo_list <- list(
+  model_1a = loo_1a,
+  model_weekend = loo_weekend,
+  model_1b = loo_1b,
+  model_2a_tv_complete = loo_2a_tv_complete,
+  model_2b = loo_2b,
+  model_2b_log = loo_2b_log
+)
+
+for (model_name in names(loo_list)) {
+  cat("\n", model_name, "\n")
+  print(loo::pareto_k_table(loo_list[[model_name]]))
+}
+
+# Pareto k summary for reporting
+bind_rows(lapply(loo_list, function(loo_result) {
+  k <- loo::pareto_k_values(loo_result)
+  tibble(
+    n = length(k),
+    n_k_above_0.7 = sum(k > 0.7),
+    percent_k_above_0.7 = mean(k > 0.7) * 100,
+    n_k_above_1 = sum(k > 1),
+    max_k = max(k)
+  )
+}), .id = "model") %>%
+  as.data.frame()
+
+loo_compare(list(model_2a_tv_complete = loo_2a_tv_complete, model_2b = loo_2b))
+loo_compare(list(model_2a_tv_complete = loo_2a_tv_complete, model_2b_log = loo_2b_log))
+loo_compare(list(model_2b = loo_2b, model_2b_log = loo_2b_log))
+```
+
+# 10-fold cross-validation (robustness check; not preregistered)
+
+LOO remains the preregistered comparison. Because many observations in
+the random-scale models have Pareto k > 0.7 even after moment matching,
+the same comparisons are repeated with 10-fold cross-validation. Folds
+are stratified by participant, so each person's days are spread across
+folds and held-out days are predicted for known participants (the same
+target as LOO). Models in each comparison share one set of folds.
+Model 1a vs. the weekend model is not repeated (no random scale; nearly
+all Pareto k values are good).
+
+```{r}
+# Same rows, so the same folds apply to both models
+stopifnot(nobs(model_weekend) == nobs(model_1b))
+
+set.seed(2026)
+folds_full <- split_folds_by_id(model_1b$data$id, K = 10)
+
+set.seed(2026)
+folds_tv <- split_folds_by_id(model_2b$data$id, K = 10)
+
+# QC: every row has a fold, and no participant has two days in one fold
+stopifnot(
+  !anyNA(folds_full), !anyNA(folds_tv),
+  !anyDuplicated(data.frame(model_1b$data$id, folds_full)),
+  !anyDuplicated(data.frame(model_2b$data$id, folds_tv))
+)
+
+table(folds_full)
+table(folds_tv)
+```
+
+```{r}
+message("10-fold CV (", tag, ")")
+
+kfold_weekend <- get_kfold(model_weekend, folds_full, file.path(model_output_dir, paste0("kfold_weekend_", tag, "_m2.rds")))
+kfold_1b <- get_kfold(model_1b, folds_full, file.path(model_output_dir, paste0("kfold_1b_", tag, "_m2.rds")))
+kfold_2a_tv_complete <- get_kfold(model_2a_tv_complete, folds_tv, file.path(model_output_dir, paste0("kfold_2a_tv_complete_", tag, "_m2.rds")))
+kfold_2b <- get_kfold(model_2b, folds_tv, file.path(model_output_dir, paste0("kfold_2b_", tag, "_m2.rds")))
+kfold_2b_log <- get_kfold(model_2b_log, folds_tv, file.path(model_output_dir, paste0("kfold_2b_log_", tag, "_m2.rds")))
+
+loo_compare(list(model_weekend = kfold_weekend, model_1b = kfold_1b))
+loo_compare(list(model_2a_tv_complete = kfold_2a_tv_complete, model_2b = kfold_2b))
+loo_compare(list(model_2a_tv_complete = kfold_2a_tv_complete, model_2b_log = kfold_2b_log))
+loo_compare(list(model_2b = kfold_2b, model_2b_log = kfold_2b_log))
+```
+
+# Model 2b with missing TV imputed (sensitivity; not preregistered)
+
+Model 2b drops days with sleep but no TV report. Here those days are
+kept, and `tv_within` on those days is imputed with `mi()`, jointly with
+the sleep model. TV person means are from each participant's observed
+TV days, as in Model 2b. The imputation model is Gaussian, so imputed
+TV values can be negative.
+
+```{r}
+M2_sample_sleep_complete <- M2_sample %>%
+  filter(!is.na(sleep_next_night_minutes))
+
+# QC: days with sleep but missing TV (imputed), and no missing person means
+M2_sample_sleep_complete %>%
+  summarise(
+    rows = n(),
+    missing_tv_within = sum(is.na(tv_within)),
+    missing_tv_person_mean = sum(is.na(tv_person_mean))
+  ) %>%
+  as.data.frame()
+```
+
+```{r}
+message("Fitting model_2b_mi (", tag, ")")
+
+model_2b_mi <- brm(
+  bf(
+    sleep_next_night_minutes ~
+      1 + weekend + age_centered + sex +
+      mi(tv_within) + tv_person_mean +
+      (1 | q | id),
+
+    sigma ~ 1 + (1 | q | id)
+  ) +
+    bf(tv_within | mi() ~ 1 + weekend) +
+    set_rescor(FALSE),
+  data = M2_sample_sleep_complete,
+  family = gaussian(),
+  chains = 4,
+  # Iterations doubled per prereg (bulk ESS < 1000 at 2000 iterations)
+  iter = 4000,
+  warmup = 2000,
+  seed = 2026,
+  file = file.path(
+    model_output_dir,
+    paste0("model_2b_mi_", tag, "_m2")
+  ),
+  file_refit = "never"
+)
+
+summary(model_2b_mi, prob = 0.9)
+
+# Observations used (Model 2b vs. imputed model)
+c(model_2b = nobs(model_2b), model_2b_mi = nrow(model_2b_mi$data))
+
+# TV coefficients, Model 2b vs. imputed model
+tv_effects <- function(fit) {
+  estimates <- fixef(fit, probs = c(0.05, 0.95))
+  rows <- grep("tv_within$|tv_person_mean$", rownames(estimates))
+  tibble(
+    term = sub(".*(tv_within|tv_person_mean)$", "\\1", rownames(estimates)[rows]),
+    as_tibble(estimates[rows, , drop = FALSE])
+  )
+}
+
+bind_rows(
+  model_2b = tv_effects(model_2b),
+  model_2b_mi = tv_effects(model_2b_mi),
+  .id = "model"
+) %>%
+  arrange(term, model) %>%
+  as.data.frame()
+
+# Convergence (prereg criteria; should show meets_prereg = TRUE)
+check_convergence(model_2b_mi) %>%
+  as.data.frame()
+```
+
+# Model diagnostics (prereg convergence and residual checks)
+
+```{r}
+models <- list(
+  model_1a = model_1a,
+  model_weekend = model_weekend,
+  model_1b = model_1b,
+  model_2a = model_2a,
+  model_2a_tv_complete = model_2a_tv_complete,
+  model_2b = model_2b,
+  model_2b_log = model_2b_log
+)
+
+# Observations used by each model
+sapply(models, nobs)
+
+# Convergence: every row should show meets_prereg = TRUE
+bind_rows(lapply(models, check_convergence), .id = "model") %>%
+  as.data.frame()
+```
+
+```{r}
+# Level-1 residual normality
+for (model_name in names(models)) {
+  check_residual_normality(models[[model_name]], model_name)
+}
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
