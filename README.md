@@ -1,4 +1,4 @@
-# More TV, Less (or More) Sleep?
+# midus_tv_sleep
 
 Analysis code for Kee, Huskey, & Blozis, a preregistered study of whether
 daily TV viewing predicts that night's sleep duration in adults, using
