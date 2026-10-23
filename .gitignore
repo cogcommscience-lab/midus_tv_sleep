@@ -1,0 +1,12 @@
+# ICPSR data can't be redistributed: keep only the README in data/
+data/*
+!data/README.txt
+
+# Analysis datasets and model fits created when the scripts are knit
+*.rds
+model_fits_*/
+
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user/

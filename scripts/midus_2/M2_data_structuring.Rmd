@@ -1,0 +1,711 @@
+---
+title: "MIDUS 2 Data Structuring"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About this script
+
+Imports the raw MIDUS 2 data, builds the daily TV and sleep variables,
+aligns day-t TV with night-t sleep, creates the employment and health
+filter variables, and saves the analytic datasets used by the
+`M2_modeling_*.Rmd` scripts.
+
+# Packages
+
+```{r}
+library(dplyr)
+library(stringr)
+library(tidyverse)
+```
+
+# Importing MIDUS 2 data
+
+Download the `.rda` files from ICPSR (see README) and put them in the
+`data/` folder at the top of the project. All paths are relative to
+this script's folder, which is the working directory when it is knit.
+
+```{r}
+# ICPSR files, relative to this script's folder (scripts/<wave>/)
+data_dir <- file.path("..", "..", "data")
+if (!dir.exists(data_dir)) {
+  stop("Put the ICPSR .rda files in the data/ folder at the top of the project (see README).")
+}
+
+# MIDUS 2 main survey (ICPSR 4652, https://doi.org/10.3886/ICPSR04652.v8)
+load(file.path(data_dir, "04652-0001-Data.rda"))
+
+# MIDUS 2 Daily Stress Project / NSDE II (ICPSR 26841, https://doi.org/10.3886/ICPSR26841.v2)
+load(file.path(data_dir, "26841-0001-Data.rda"))
+```
+
+# Structuring MIDUS 2 data
+
+```{r}
+# Pulling from daily diary data
+M2_diary_data <- da26841.0001 %>%
+  transmute(
+    id = M2ID,
+
+    # Family ID. Milwaukee participants have no M2FAMNUM, so each gets a
+    # unique placeholder (their negated M2ID) so no one is treated as related.
+    M2FAMNUM = if_else(is.na(M2FAMNUM), -M2ID, M2FAMNUM),
+
+    age = B1PAGE_M2,
+
+    # 0 = male, 1 = female
+    sex = case_when(
+      readr::parse_number(as.character(B1PGENDER)) == 1 ~ 0,
+      readr::parse_number(as.character(B1PGENDER)) == 2 ~ 1,
+      TRUE ~ NA_real_
+    ),
+
+    diary_day = readr::parse_number(as.character(B2DDAY)),
+    # 1 = Monday ... 7 = Sunday
+    weekday = readr::parse_number(as.character(B2DWEEKD)),
+
+    wake_hour = B2DWAKE1,
+    wake_minute = B2DWAKE2,
+    wake_ampm = B2DWAKE3,
+
+    sleep_hours = B2DAW1CH,
+    sleep_minutes = B2DAW1CM,
+
+    tv_hours = B2DAW4H,
+    tv_minutes = B2DAW4M,
+
+    work_hours = B2DA3H,
+    work_minutes = B2DA3M,
+
+    work_start_hour = B2DA3AH2,
+    work_start_minute = B2DA3AM2,
+    work_start_ampm = B2DA3AAP,
+
+    work_end_hour = B2DA3BH2,
+    work_end_minute = B2DA3BM2,
+    work_end_ampm = B2DA3BAP,
+
+    # Daily number of stressors
+    number_stressors = readr::parse_number(
+      as.character(B2DN_STR)
+    ),
+
+    # Average stressor severity (0 = "Not at all" to 3 = "Very").
+    # MIDUS leaves this missing on days with zero stressors; recoded to 0
+    # on interviewed days, while days with no interview stay missing.
+    stressor_severity_average = case_when(
+      readr::parse_number(as.character(B2DN_STR)) == 0 ~ 0,
+      TRUE ~ readr::parse_number(as.character(B2DSSEVA))
+    ),
+
+    physical_activity_hours = B2DA4AH,
+    physical_activity_minutes = B2DA4AM
+  )
+
+# Health variables from the M2 parent survey
+# (does not include the Milwaukee participants)
+M2_parent_data <- da04652.0001 %>%
+  transmute(
+    id = M2ID,
+
+    head_injury = case_when(
+      readr::parse_number(as.character(B1PA6B)) == 1 ~ 1,
+      readr::parse_number(as.character(B1PA6B)) == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+
+    neurological_disorder = case_when(
+      readr::parse_number(as.character(B1PA6D)) == 1 ~ 1,
+      readr::parse_number(as.character(B1PA6D)) == 2 ~ 0,
+      TRUE ~ NA_real_
+    ),
+
+    chronic_sleep_problem = case_when(
+      readr::parse_number(as.character(B1SA11W)) == 1 ~ 1,
+      readr::parse_number(as.character(B1SA11W)) == 2 ~ 0,
+      TRUE ~ NA_real_
+    )
+  )
+
+# Health variables for the Milwaukee participants come from the
+# RESTRICTED-USE MIDUS 2 Milwaukee file (ICPSR 22840,
+# https://doi.org/10.3886/ICPSR22840.v7), which requires an ICPSR
+# restricted-data agreement. Without it, these participants' health
+# variables stay missing, which only affects the no-health-conditions sample.
+milwaukee_file <- file.path(data_dir, "22840-0001-Data-REST.rda")
+
+if (file.exists(milwaukee_file)) {
+  load(milwaukee_file)
+
+  M2_milwaukee_data <- da22840.0001 %>%
+    transmute(
+      id = M2ID,
+
+      head_injury = case_when(
+        readr::parse_number(as.character(BACA6B)) == 1 ~ 1,
+        readr::parse_number(as.character(BACA6B)) == 2 ~ 0,
+        TRUE ~ NA_real_
+      ),
+
+      neurological_disorder = case_when(
+        readr::parse_number(as.character(BACA6D)) == 1 ~ 1,
+        readr::parse_number(as.character(BACA6D)) == 2 ~ 0,
+        TRUE ~ NA_real_
+      ),
+
+      chronic_sleep_problem = case_when(
+        readr::parse_number(as.character(BACAS11W)) == 1 ~ 1,
+        readr::parse_number(as.character(BACAS11W)) == 2 ~ 0,
+        TRUE ~ NA_real_
+      )
+    )
+} else {
+  message("Restricted Milwaukee file not found: Milwaukee health variables will be NA.")
+
+  M2_milwaukee_data <- tibble(
+    id = M2_diary_data$id[0],
+    head_injury = numeric(),
+    neurological_disorder = numeric(),
+    chronic_sleep_problem = numeric()
+  )
+}
+
+# Combining the data
+M2_long <- M2_diary_data %>%
+  left_join(M2_parent_data, by = "id") %>%
+  left_join(M2_milwaukee_data, by = "id", suffix = c("", "_milwaukee")) %>%
+  mutate(
+    head_injury = coalesce(head_injury, head_injury_milwaukee),
+    neurological_disorder = coalesce(neurological_disorder, neurological_disorder_milwaukee),
+    chronic_sleep_problem = coalesce(chronic_sleep_problem, chronic_sleep_problem_milwaukee)
+  ) %>%
+  select(-head_injury_milwaukee, -neurological_disorder_milwaukee, -chronic_sleep_problem_milwaukee)
+
+# QC: joining should not add or drop rows
+stopifnot(
+  nrow(M2_long) == nrow(M2_diary_data),
+  n_distinct(M2_long$id) == n_distinct(M2_diary_data$id)
+)
+```
+
+# Siblings and twins
+
+```{r}
+# Number of sibling and twin participants
+da26841.0001 %>%
+  filter(SAMPLMAJ %in% c("(02) Sibling", "(03) Twin")) %>%
+  group_by(SAMPLMAJ) %>%
+  summarise(
+    participants = n_distinct(M2ID),
+    rows = n(),
+    .groups = "drop"
+  )
+
+# Main sample without siblings and twins (used for the no_sibtwin dataset)
+M2_main_sample <- da26841.0001 %>%
+  filter(
+    !SAMPLMAJ %in% c("(02) Sibling", "(03) Twin")
+  )
+```
+
+# Converting 12-hour clock times to minutes since midnight
+
+```{r}
+convert_to_minutes <- function(hour, minute, ampm) {
+
+  ampm_clean <- case_when(
+    grepl("AM", ampm, ignore.case = TRUE) ~ "AM",
+    grepl("PM", ampm, ignore.case = TRUE) ~ "PM",
+    TRUE ~ NA_character_
+  )
+
+  hour_24 <- case_when(
+    ampm_clean == "AM" & hour == 12 ~ 0,
+    ampm_clean == "PM" & hour != 12 ~ hour + 12,
+    TRUE ~ hour
+  )
+
+  hour_24 * 60 + minute
+}
+```
+
+# Creating work summary variables for employment filtering
+
+MIDUS 2 has no shift-type variable, so employment status is derived from
+diary-reported work:
+
+-   `is_fulltime`: total work hours summed across the diary week \>= 36.
+-   `is_standard_shift`: average work start AND end times both fall
+    between 6 AM and 8 PM.
+
+```{r}
+M2_work_summary <- M2_long %>%
+  mutate(
+    # Total work duration in minutes
+    work_duration_minutes = case_when(
+      is.na(work_hours) & is.na(work_minutes) ~ NA_real_,
+      TRUE ~ coalesce(work_hours, 0) * 60 +
+        coalesce(work_minutes, 0)
+    ),
+
+    # Start and end times in decimal hours
+    work_start_time = convert_to_minutes(
+      work_start_hour,
+      work_start_minute,
+      work_start_ampm
+    ) / 60,
+
+    work_end_time = convert_to_minutes(
+      work_end_hour,
+      work_end_minute,
+      work_end_ampm
+    ) / 60,
+
+    worked_today = !is.na(work_duration_minutes) &
+      work_duration_minutes > 0
+  ) %>%
+  group_by(id) %>%
+  summarise(
+    days_worked = sum(worked_today),
+
+    total_work_hours =
+      sum(work_duration_minutes[worked_today], na.rm = TRUE) / 60,
+
+    average_start_time =
+      mean(work_start_time[worked_today], na.rm = TRUE),
+
+    average_end_time =
+      mean(work_end_time[worked_today], na.rm = TRUE),
+
+    .groups = "drop"
+  ) %>%
+  mutate(
+    # NaN (no worked days) -> NA
+    across(
+      c(
+        average_start_time,
+        average_end_time
+      ),
+      ~ ifelse(is.nan(.x), NA_real_, .x)
+    ),
+
+    is_fulltime = case_when(
+      is.na(total_work_hours) ~ 0,
+      total_work_hours >= 36 ~ 1,
+      TRUE ~ 0
+    ),
+
+    is_standard_shift = case_when(
+      is.na(average_start_time) | is.na(average_end_time) ~ 0,
+      average_start_time >= 6 & average_start_time <= 20 &
+        average_end_time >= 6 & average_end_time <= 20 ~ 1,
+      TRUE ~ 0
+    )
+  )
+```
+
+# Creating daily TV and sleep variables
+
+```{r}
+M2_daily_prepared <- M2_long %>%
+  mutate(
+
+    # TV in minutes (missing only if both hours and minutes are missing)
+    tv_duration_minutes = case_when(
+      is.na(tv_hours) & is.na(tv_minutes) ~ NA_real_,
+      TRUE ~
+        coalesce(tv_hours, 0) * 60 +
+        coalesce(tv_minutes, 0)
+    ),
+
+    # 1 = any TV that day, 0 = none, NA = TV missing
+    watched_tv = case_when(
+      is.na(tv_duration_minutes) ~ NA_integer_,
+      tv_duration_minutes > 0 ~ 1L,
+      TRUE ~ 0L
+    ),
+
+    tv_duration_if_watched = case_when(
+      tv_duration_minutes > 0 ~ tv_duration_minutes,
+      TRUE ~ NA_real_
+    ),
+
+    # Sleep in minutes (reported sleep reflects the previous night)
+    sleep_duration_minutes = case_when(
+      is.na(sleep_hours) & is.na(sleep_minutes) ~ NA_real_,
+      TRUE ~
+        coalesce(sleep_hours, 0) * 60 +
+        coalesce(sleep_minutes, 0)
+    )
+  )
+```
+
+# Recoding implausible values
+
+Per the prereg, only impossible values (negative or \> 24 hours) are set
+to missing. Plausible but extreme values are retained. Days where TV +
+sleep exceed 24 hours are flagged, not excluded.
+
+```{r}
+# Implausible values before recoding
+implausible_tv_before <- sum(
+  M2_daily_prepared$tv_duration_minutes < 0 |
+    M2_daily_prepared$tv_duration_minutes > 24 * 60,
+  na.rm = TRUE
+)
+
+implausible_sleep_before <- sum(
+  M2_daily_prepared$sleep_duration_minutes < 0 |
+    M2_daily_prepared$sleep_duration_minutes > 24 * 60,
+  na.rm = TRUE
+)
+
+implausible_tv_before
+implausible_sleep_before
+
+# Recoding implausible values as missing
+M2_daily_prepared <- M2_daily_prepared %>%
+  mutate(
+    tv_duration_minutes = if_else(
+      tv_duration_minutes < 0 | tv_duration_minutes > 24 * 60,
+      NA_real_,
+      tv_duration_minutes
+    ),
+
+    sleep_duration_minutes = if_else(
+      sleep_duration_minutes < 0 | sleep_duration_minutes > 24 * 60,
+      NA_real_,
+      sleep_duration_minutes
+    ),
+
+    tv_plus_sleep_over_24h = case_when(
+      is.na(tv_duration_minutes) | is.na(sleep_duration_minutes) ~ NA,
+      (tv_duration_minutes + sleep_duration_minutes) > 24 * 60 ~ TRUE,
+      TRUE ~ FALSE
+    )
+  )
+
+# QC: no implausible values remain
+stopifnot(
+  sum(M2_daily_prepared$tv_duration_minutes < 0 |
+        M2_daily_prepared$tv_duration_minutes > 24 * 60, na.rm = TRUE) == 0,
+  sum(M2_daily_prepared$sleep_duration_minutes < 0 |
+        M2_daily_prepared$sleep_duration_minutes > 24 * 60, na.rm = TRUE) == 0
+)
+
+# Number of days flagged as TV + sleep > 24 hours
+sum(M2_daily_prepared$tv_plus_sleep_over_24h, na.rm = TRUE)
+```
+
+# Missingness and ranges of daily TV and sleep
+
+```{r}
+M2_daily_prepared %>%
+  summarise(
+    diary_rows = n(),
+    participants = n_distinct(id),
+
+    missing_tv_n = sum(is.na(tv_duration_minutes)),
+    missing_tv_percent =
+      mean(is.na(tv_duration_minutes)) * 100,
+    minimum_tv_minutes =
+      min(tv_duration_minutes, na.rm = TRUE),
+    maximum_tv_minutes =
+      max(tv_duration_minutes, na.rm = TRUE),
+
+    missing_sleep_n = sum(is.na(sleep_duration_minutes)),
+    missing_sleep_percent =
+      mean(is.na(sleep_duration_minutes)) * 100,
+    minimum_sleep_minutes =
+      min(sleep_duration_minutes, na.rm = TRUE),
+    maximum_sleep_minutes =
+      max(sleep_duration_minutes, na.rm = TRUE)
+  )
+
+# QC: one record per participant per diary day
+stopifnot(
+  nrow(count(M2_daily_prepared, id, diary_day) %>% filter(n != 1)) == 0
+)
+```
+
+# Aligning TV (day t) with that night's sleep (reported on day t + 1)
+
+TV on diary days 1-7 is paired with sleep reported on days 2-8, so day-8
+TV and day-1 sleep drop out (per the prereg).
+
+```{r}
+M2_lagged <- M2_daily_prepared %>%
+  arrange(id, diary_day) %>%
+  group_by(id) %>%
+  mutate(
+    next_diary_day = lead(diary_day),
+    sleep_next_night_minutes =
+      lead(sleep_duration_minutes)
+  ) %>%
+  # Keeping only consecutive interview days
+  filter(
+    next_diary_day == diary_day + 1
+  ) %>%
+  ungroup()
+
+M2_lagged %>%
+  summarise(
+    lagged_rows = n(),
+    participants = n_distinct(id),
+    missing_tv_n = sum(is.na(tv_duration_minutes)),
+    missing_next_sleep_n = sum(is.na(sleep_next_night_minutes)),
+    complete_tv_sleep_pairs =
+      sum(
+        !is.na(tv_duration_minutes) &
+          !is.na(sleep_next_night_minutes)
+      )
+  )
+```
+
+# Creating the final analysis dataset
+
+No rows are removed here. Each model uses the observations that are
+complete for its own variables.
+
+```{r}
+M2_analysis <- M2_lagged %>%
+  left_join(
+    M2_work_summary,
+    by = "id"
+  ) %>%
+  mutate(
+    missing_tv = as.integer(is.na(tv_duration_minutes)),
+    missing_sleep = as.integer(is.na(sleep_next_night_minutes)),
+    # First TV / next-night sleep pair (for the first-day sensitivity models)
+    first_day = as.integer(diary_day == 1)
+  )
+
+stopifnot(nrow(M2_analysis) == nrow(M2_lagged))
+
+# Log-transformed TV (right-skewed; used in the secondary log-TV models)
+M2_analysis$tv_duration_minutes_log <- log1p(M2_analysis$tv_duration_minutes)
+
+# Weekend indicator (prereg Level-1 control): TV day is Saturday or Sunday,
+# so the paired sleep outcome is Saturday or Sunday night.
+M2_analysis <- M2_analysis %>%
+  mutate(
+    weekend = as.integer(weekday %in% c(6, 7))
+  )
+
+M2_analysis_data <- M2_analysis
+```
+
+# Sample size under each filter
+
+```{r}
+filter_preview <- tibble(
+  Stage = c(
+    "Whole dataset",
+    "Full-time only",
+    "Full-time + standard shift",
+    "Full-time + standard shift + no head injury/neuro disorder/chronic sleep problem"
+  ),
+
+  Observations = c(
+    nrow(M2_analysis_data),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1) %>%
+      nrow(),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1, is_standard_shift == 1) %>%
+      nrow(),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1, is_standard_shift == 1,
+             head_injury == 0, neurological_disorder == 0,
+             chronic_sleep_problem == 0) %>%
+      nrow()
+  ),
+
+  Participants = c(
+    n_distinct(M2_analysis_data$id),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1) %>%
+      summarise(n = n_distinct(id)) %>%
+      pull(n),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1, is_standard_shift == 1) %>%
+      summarise(n = n_distinct(id)) %>%
+      pull(n),
+
+    M2_analysis_data %>%
+      filter(is_fulltime == 1, is_standard_shift == 1,
+             head_injury == 0, neurological_disorder == 0,
+             chronic_sleep_problem == 0) %>%
+      summarise(n = n_distinct(id)) %>%
+      pull(n)
+  )
+)
+
+filter_preview
+```
+
+# Describing the full sample
+
+```{r}
+# Age (participant level)
+M2_analysis_data %>%
+  distinct(id, age) %>%
+  summarise(
+    mean_age = mean(age, na.rm = TRUE),
+    sd_age = sd(age, na.rm = TRUE),
+    min_age = min(age, na.rm = TRUE),
+    max_age = max(age, na.rm = TRUE)
+  )
+
+# Sex (0 = male, 1 = female)
+M2_analysis_data %>%
+  distinct(id, sex) %>%
+  count(sex) %>%
+  mutate(
+    percent = n / sum(n) * 100
+  )
+
+# TV viewing in minutes (raw and log-transformed)
+M2_analysis_data %>%
+  summarise(
+    mean_tv = mean(tv_duration_minutes, na.rm = TRUE),
+    sd_tv = sd(tv_duration_minutes, na.rm = TRUE),
+    median_tv = median(tv_duration_minutes, na.rm = TRUE),
+    min_tv = min(tv_duration_minutes, na.rm = TRUE),
+    max_tv = max(tv_duration_minutes, na.rm = TRUE),
+
+    mean_tv_log = mean(tv_duration_minutes_log, na.rm = TRUE),
+    sd_tv_log = sd(tv_duration_minutes_log, na.rm = TRUE),
+    median_tv_log = median(tv_duration_minutes_log, na.rm = TRUE)
+  )
+
+# Next-night sleep in minutes
+M2_analysis_data %>%
+  summarise(
+    mean_sleep = mean(sleep_next_night_minutes, na.rm = TRUE),
+    sd_sleep = sd(sleep_next_night_minutes, na.rm = TRUE),
+    median_sleep = median(sleep_next_night_minutes, na.rm = TRUE),
+    min_sleep = min(sleep_next_night_minutes, na.rm = TRUE),
+    max_sleep = max(sleep_next_night_minutes, na.rm = TRUE)
+  )
+```
+
+# Saving the analysis datasets
+
+All analysis samples are restricted to full-time, standard-shift
+participants (prereg). The sensitivity samples build on that.
+
+```{r}
+# Whole sample (unfiltered)
+saveRDS(M2_analysis_data, "M2_analysis_data.rds")
+
+# Primary (prereg): full-time + standard shift
+M2_analysis_data_fulltime_standard <- M2_analysis_data %>%
+  filter(
+    is_fulltime == 1,
+    is_standard_shift == 1
+  )
+
+saveRDS(
+  M2_analysis_data_fulltime_standard,
+  "M2_analysis_data_fulltime_standard.rds"
+)
+
+# Sensitivity: siblings and twins excluded
+non_sibling_twin_ids <- unique(M2_main_sample$M2ID)
+
+M2_analysis_data_no_sibtwin <- M2_analysis_data_fulltime_standard %>%
+  filter(id %in% non_sibling_twin_ids)
+
+saveRDS(
+  M2_analysis_data_no_sibtwin,
+  "M2_analysis_data_no_sibtwin.rds"
+)
+
+# Sensitivity: one randomly selected participant per family (M2FAMNUM)
+set.seed(2026)
+
+one_per_family_ids <- M2_analysis_data_fulltime_standard %>%
+  distinct(id, M2FAMNUM) %>%
+  group_by(M2FAMNUM) %>%
+  slice_sample(n = 1) %>%
+  ungroup() %>%
+  pull(id)
+
+M2_analysis_data_one_per_family <- M2_analysis_data_fulltime_standard %>%
+  filter(id %in% one_per_family_ids)
+
+saveRDS(
+  M2_analysis_data_one_per_family,
+  "M2_analysis_data_one_per_family.rds"
+)
+
+# Sensitivity: diary days on which TV was watched
+M2_analysis_data_tv_watchers <- M2_analysis_data_fulltime_standard %>%
+  filter(watched_tv == 1)
+
+saveRDS(
+  M2_analysis_data_tv_watchers,
+  "M2_analysis_data_tv_watchers.rds"
+)
+
+# Secondary (prereg secondary analysis 3): no head injury,
+# neurological disorder, or chronic sleep problem
+M2_analysis_data_no_health_conditions <- M2_analysis_data_fulltime_standard %>%
+  filter(
+    head_injury == 0,
+    neurological_disorder == 0,
+    chronic_sleep_problem == 0
+  )
+
+saveRDS(
+  M2_analysis_data_no_health_conditions,
+  "M2_analysis_data_no_health_conditions.rds"
+)
+```
+
+# Sample sizes across analysis datasets
+
+```{r}
+dataset_comparison <- tibble(
+  Dataset = c(
+    "Full-time + standard shift",
+    "Full-time + standard shift + no siblings/twins",
+    "Full-time + standard shift + one random sibling/twin per family",
+    "Full-time + standard shift + TV watchers only",
+    "Full-time + standard shift + no health conditions"
+  ),
+
+  Observations = c(
+    nrow(M2_analysis_data_fulltime_standard),
+    nrow(M2_analysis_data_no_sibtwin),
+    nrow(M2_analysis_data_one_per_family),
+    nrow(M2_analysis_data_tv_watchers),
+    nrow(M2_analysis_data_no_health_conditions)
+  ),
+
+  Participants = c(
+    n_distinct(M2_analysis_data_fulltime_standard$id),
+    n_distinct(M2_analysis_data_no_sibtwin$id),
+    n_distinct(M2_analysis_data_one_per_family$id),
+    n_distinct(M2_analysis_data_tv_watchers$id),
+    n_distinct(M2_analysis_data_no_health_conditions$id)
+  )
+)
+
+dataset_comparison
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
