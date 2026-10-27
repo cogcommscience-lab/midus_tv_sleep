@@ -1,0 +1,278 @@
+---
+title: "Model 3: Cross-Wave Stability (MIDUS 2 / MIDUS 3)"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About this script
+
+**Preregistered analysis (main text; RQ3).** Joint models of individual
+stability across MIDUS 2 and MIDUS 3 in (3a) average daily sleep duration
+and (3b) day-to-day sleep variability. Both are unconditional-means models
+(plus the `weekend` control retained in all models) fit to the
+participants in the full-time, standard-shift samples of both waves.
+Run the MIDUS 2 and MIDUS 3 structuring scripts first.
+
+Both models use 4000 iterations (2000 warmup) and `adapt_delta = 0.99`.
+An earlier version of Model 3a had bulk ESS < 1000 at the preregistered
+2000 iterations, so its iterations were doubled.
+
+# Packages, data, and helper functions
+
+```{r}
+library(dplyr)
+library(brms)
+
+M2_sample <- readRDS("../midus_2/M2_analysis_data_fulltime_standard.rds")
+M3_sample <- readRDS("../midus_3/M3_analysis_data_fulltime_standard.rds")
+
+model_output_dir <- "model_fits_cross_wave"
+dir.create(model_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Prereg convergence criteria: R-hat < 1.01, bulk and tail ESS > 1000,
+# and 0 divergent transitions (population-level, SD, and correlation
+# parameters)
+check_convergence <- function(fit) {
+  draws_summary <- posterior::summarise_draws(
+    as_draws_df(fit, variable = "^(b_|sd_|cor_|sigma$)", regex = TRUE),
+    "rhat", "ess_bulk", "ess_tail"
+  )
+
+  tibble(
+    max_rhat = max(draws_summary$rhat, na.rm = TRUE),
+    min_bulk_ess = min(draws_summary$ess_bulk, na.rm = TRUE),
+    min_tail_ess = min(draws_summary$ess_tail, na.rm = TRUE),
+    divergent = sum(nuts_params(fit, pars = "divergent__")$Value)
+  ) %>%
+    mutate(
+      meets_prereg = max_rhat < 1.01 & min_bulk_ess > 1000 &
+        min_tail_ess > 1000 & divergent == 0
+    )
+}
+
+# Prereg assumption check: Q-Q plot of level-1 residuals
+check_residual_normality <- function(fit, label) {
+  resid_est <- residuals(
+    fit,
+    method = "posterior_predict"
+  )[, "Estimate"]
+
+  qqnorm(
+    resid_est,
+    main = paste0(label, ": Level-1 residual Q-Q plot")
+  )
+
+  qqline(resid_est)
+}
+
+# Both samples are already restricted to full-time, standard shift
+stopifnot(
+  all(M2_sample$is_fulltime == 1),
+  all(M2_sample$is_standard_shift == 1),
+  all(M3_sample$is_fulltime == 1),
+  all(M3_sample$is_standard_shift == 1)
+)
+```
+
+# Building the MIDUS 2 / MIDUS 3 panel
+
+Only participants in both waves are included (prereg; MIDUS 2
+participants who did not return are assumed missing at random). MIDUS 3
+participants keep their MIDUS 2 `id`.
+
+```{r}
+panel_ids <- intersect(unique(M2_sample$id), unique(M3_sample$id))
+
+M2_panel <- M2_sample %>% filter(id %in% panel_ids)
+M3_panel <- M3_sample %>% filter(id %in% panel_ids)
+
+cat(
+  "Full-time/standard-shift participants:\n",
+  "  MIDUS 2:", n_distinct(M2_sample$id), "\n",
+  "  MIDUS 3:", n_distinct(M3_sample$id), "\n",
+  "  In both waves (the panel):", length(panel_ids), "\n"
+)
+
+long_data <- bind_rows(
+  M2_panel %>%
+    transmute(id, weekend, sleep_next_night_minutes, wave = 1),
+  M3_panel %>%
+    transmute(id, weekend, sleep_next_night_minutes, wave = 2)
+)
+
+long_data$wave <- factor(
+  long_data$wave,
+  levels = c(1, 2),
+  labels = c("MIDUS2", "MIDUS3")
+)
+
+# QC: rows per wave; every panel participant appears in both waves
+table(long_data$wave, useNA = "ifany")
+
+long_data %>%
+  distinct(id, wave) %>%
+  count(id) %>%
+  count(n, name = "n_participants")
+```
+
+# Panel sample description
+
+The panel is used only in this script, so it is described here. Age and
+sex are at the participant level; sleep is at the diary-day level.
+
+```{r}
+panel_by_wave <- bind_rows(
+  MIDUS2 = M2_panel,
+  MIDUS3 = M3_panel,
+  .id = "wave"
+)
+
+# Participant level: age at each wave, and sex
+panel_by_wave %>%
+  distinct(wave, id, age, sex) %>%
+  group_by(wave) %>%
+  summarise(
+    participants = n(),
+    age_mean = mean(age, na.rm = TRUE),
+    age_sd = sd(age, na.rm = TRUE),
+    age_min = min(age, na.rm = TRUE),
+    age_max = max(age, na.rm = TRUE),
+    n_female = sum(sex == 1, na.rm = TRUE),
+    percent_female = mean(sex == 1, na.rm = TRUE) * 100
+  ) %>%
+  as.data.frame()
+
+# Diary-day level: sleep, with between-person SD (SD of person means) and
+# within-person SD (SD of deviations from each person's own mean)
+panel_by_wave %>%
+  filter(!is.na(sleep_next_night_minutes)) %>%
+  group_by(wave, id) %>%
+  mutate(
+    person_mean = mean(sleep_next_night_minutes),
+    deviation = sleep_next_night_minutes - person_mean
+  ) %>%
+  group_by(wave) %>%
+  summarise(
+    sleep_observations = n(),
+    sleep_mean = mean(sleep_next_night_minutes),
+    sleep_sd = sd(sleep_next_night_minutes),
+    sleep_median = median(sleep_next_night_minutes),
+    between_person_sd = sd(person_mean[!duplicated(id)]),
+    within_person_sd = sd(deviation)
+  ) %>%
+  as.data.frame()
+```
+
+# Model 3a: stability of average daily sleep duration
+
+Each wave gets its own mean (`0 + wave`). The two waves' random
+intercepts are allowed to correlate, and that correlation is the
+stability estimate. Because Model 1b (random scale) fit better than
+Model 1a in both waves, 3a uses that formulation (prereg): each person
+also has a wave-specific random scale on `sigma`. The scale effects are
+uncorrelated here (`||`); their correlations, including the cross-wave
+variability correlation, are what Model 3b adds.
+
+```{r}
+bf_model_3a <- bf(
+  sleep_next_night_minutes ~ 0 + wave + weekend + (0 + wave | id),
+  sigma ~ 0 + wave + (0 + wave || id)
+)
+
+fit_3a <- brm(
+  bf_model_3a,
+  data = long_data,
+  family = gaussian(),
+  chains = 4,
+  # Iterations doubled per prereg (bulk ESS < 1000 at 2000 iterations)
+  iter = 4000,
+  warmup = 2000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file = file.path(model_output_dir, "model_3a_stability_m2_m3"),
+  file_refit = "never"
+)
+
+summary(fit_3a, prob = 0.9)
+
+# Random-intercept correlation (90% credible interval)
+vc_3a <- VarCorr(
+  fit_3a,
+  probs = c(0.05, 0.95)
+)
+
+vc_3a$id$cor["waveMIDUS2", c("Estimate", "Q5", "Q95"), "waveMIDUS3"]
+```
+
+# Model 3b: stability of day-to-day sleep variability
+
+Adds a person- and wave-specific random scale to `sigma`. The shared `c`
+tag correlates all four random effects; the MIDUS 2 scale vs. MIDUS 3
+scale correlation is the stability of day-to-day variability.
+
+```{r}
+bf_model_3b <- bf(
+  sleep_next_night_minutes ~ 0 + wave + weekend + (0 + wave | c | id),
+  sigma ~ 0 + wave + (0 + wave | c | id)
+)
+
+fit_3b <- brm(
+  bf_model_3b,
+  data = long_data,
+  family = gaussian(),
+  chains = 4,
+  iter = 4000,
+  warmup = 2000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  control = list(adapt_delta = 0.99),
+  file = file.path(model_output_dir, "model_3b_stability_m2_m3"),
+  file_refit = "never"
+)
+
+summary(fit_3b, prob = 0.9)
+
+vc_3b <- VarCorr(
+  fit_3b,
+  probs = c(0.05, 0.95)
+)
+
+# Full 4 x 4 correlation matrix (point estimates)
+vc_3b$id$cor[, "Estimate", ]
+
+# Stability in average sleep (90% credible interval)
+vc_3b$id$cor["waveMIDUS2", c("Estimate", "Q5", "Q95"), "waveMIDUS3"]
+
+# Stability in day-to-day sleep variability (90% credible interval)
+vc_3b$id$cor["sigma_waveMIDUS2", c("Estimate", "Q5", "Q95"), "sigma_waveMIDUS3"]
+```
+
+# Model diagnostics (prereg convergence and residual checks)
+
+```{r}
+models <- list(
+  fit_3a = fit_3a,
+  fit_3b = fit_3b
+)
+
+sapply(models, nobs)
+
+# Convergence: every row should show meets_prereg = TRUE
+bind_rows(lapply(models, check_convergence), .id = "model")
+```
+
+```{r}
+for (model_name in names(models)) {
+  check_residual_normality(models[[model_name]], model_name)
+}
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
