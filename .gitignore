@@ -10,3 +10,6 @@ model_fits_*/
 .Rhistory
 .RData
 .Rproj.user/
+
+# Figure-review values list participant IDs
+scripts/paper_figures/figures/*.csv

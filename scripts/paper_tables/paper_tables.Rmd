@@ -1,0 +1,203 @@
+---
+title: "Values for the Manuscript Tables"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About this script
+
+Computes every value reported in the manuscript's tables, so each table
+can be checked against the data. Run the three data structuring scripts
+first. Each table's section prints a formatted table (as reported) and
+the unrounded values behind it.
+
+# Packages and data
+
+```{r}
+library(dplyr)
+
+samples <- list(
+  "MIDUS 2" = readRDS("../midus_2/M2_analysis_data_fulltime_standard.rds"),
+  "MIDUS Refresher 1" = readRDS("../midus_refresher/MR_analysis_data_fulltime_standard.rds"),
+  "MIDUS 3" = readRDS("../midus_3/M3_analysis_data_fulltime_standard.rds")
+)
+
+# Drop diary days with no recorded weekday (weekend missing), as the
+# modeling scripts do (2 MIDUS 3 days; none in MIDUS 2 or the Refresher)
+samples <- lapply(samples, filter, !is.na(weekend))
+sapply(samples, nrow)
+
+# Formatting helpers
+f2 <- function(x) formatC(x, format = "f", digits = 2, big.mark = ",")
+n_pct <- function(n, pct) {
+  paste0(format(n, big.mark = ","), " (", formatC(pct, format = "f", digits = 1), ")")
+}
+m_sd <- function(m, s) paste0(f2(m), " (", f2(s), ")")
+```
+
+# Table X: Descriptive statistics for the analytic samples
+
+Full-time, standard-shift samples. Percentages of no-TV days use days
+with a TV report; percentages of weekend days use all diary days.
+Between-person SD is the SD of person means; within-person SD is the SD
+of each day's deviation from the person's own mean.
+
+```{r}
+# Overall M, SD, median, and between- and within-person SD of a
+# diary-day variable (days with the variable reported)
+describe_levels <- function(data, variable) {
+  data %>%
+    filter(!is.na({{ variable }})) %>%
+    group_by(id) %>%
+    mutate(
+      person_mean = mean({{ variable }}),
+      deviation = {{ variable }} - person_mean
+    ) %>%
+    ungroup() %>%
+    summarise(
+      n = n(),
+      mean = mean({{ variable }}),
+      sd = sd({{ variable }}),
+      median = median({{ variable }}),
+      between_sd = sd(person_mean[!duplicated(id)]),
+      within_sd = sd(deviation)
+    )
+}
+
+describe_sample <- function(data) {
+  person <- data %>%
+    group_by(id) %>%
+    summarise(
+      age = first(age),
+      sex = first(sex),
+      days_worked = first(days_worked),
+      total_work_hours = first(total_work_hours),
+      any_tv = any(tv_duration_minutes > 0, na.rm = TRUE)
+    )
+
+  pairs <- data %>%
+    group_by(id) %>%
+    summarise(
+      n = sum(!is.na(sleep_next_night_minutes) & !is.na(tv_duration_minutes))
+    )
+
+  sleep <- describe_levels(data, sleep_next_night_minutes)
+  tv <- describe_levels(data, tv_duration_minutes)
+
+  tibble(
+    participants = nrow(person),
+    age_mean = mean(person$age),
+    age_sd = sd(person$age),
+    n_women = sum(person$sex == 1), # sex: 0 = male, 1 = female
+    pct_women = mean(person$sex == 1) * 100,
+    days_worked_mean = mean(person$days_worked),
+    days_worked_sd = sd(person$days_worked),
+    work_hours_mean = mean(person$total_work_hours),
+    work_hours_sd = sd(person$total_work_hours),
+    n_any_tv = sum(person$any_tv),
+    pct_any_tv = mean(person$any_tv) * 100,
+    sleep_mean = sleep$mean,
+    sleep_sd = sleep$sd,
+    sleep_between_sd = sleep$between_sd,
+    sleep_within_sd = sleep$within_sd,
+    tv_mean = tv$mean,
+    tv_sd = tv$sd,
+    tv_median = tv$median,
+    tv_between_sd = tv$between_sd,
+    tv_within_sd = tv$within_sd,
+    n_no_tv_days = sum(data$tv_duration_minutes == 0, na.rm = TRUE),
+    pct_no_tv_days = mean(data$tv_duration_minutes == 0, na.rm = TRUE) * 100,
+    n_weekend = sum(data$weekend == 1),
+    pct_weekend = mean(data$weekend == 1) * 100,
+    diary_days = nrow(data),
+    n_missing_sleep = sum(is.na(data$sleep_next_night_minutes)),
+    pct_missing_sleep = mean(is.na(data$sleep_next_night_minutes)) * 100,
+    n_missing_tv = sum(is.na(data$tv_duration_minutes)),
+    pct_missing_tv = mean(is.na(data$tv_duration_minutes)) * 100,
+    pairs_sleep = sleep$n,
+    pairs_sleep_tv = sum(pairs$n),
+    pairs_per_person_mean = mean(pairs$n),
+    pairs_per_person_median = median(pairs$n)
+  )
+}
+
+table_x_values <- bind_rows(lapply(samples, describe_sample), .id = "sample")
+
+# Unrounded values
+table_x_values %>%
+  tidyr::pivot_longer(-sample) %>%
+  tidyr::pivot_wider(names_from = sample) %>%
+  as.data.frame()
+```
+
+```{r}
+# As reported
+table_x <- with(table_x_values, tibble(
+  sample = sample,
+  "Participants, N" = format(participants, big.mark = ","),
+  "Age, M (SD)" = m_sd(age_mean, age_sd),
+  "Women, n (%)" = n_pct(n_women, pct_women),
+  "Days worked, M (SD)" = m_sd(days_worked_mean, days_worked_sd),
+  "Hours worked, M (SD)" = m_sd(work_hours_mean, work_hours_sd),
+  "Watched TV on >= 1 diary day, n (%)" = n_pct(n_any_tv, pct_any_tv),
+  "Next-night sleep (min), M (SD)" = m_sd(sleep_mean, sleep_sd),
+  "Between-person SD / within-person SD (sleep)" =
+    paste(f2(sleep_between_sd), "/", f2(sleep_within_sd)),
+  "Daily TV (min), M (SD)" = m_sd(tv_mean, tv_sd),
+  "Mdn (TV)" = format(tv_median),
+  "Between-person SD / within-person SD (TV)" =
+    paste(f2(tv_between_sd), "/", f2(tv_within_sd)),
+  "Days with no TV, n (%)" = n_pct(n_no_tv_days, pct_no_tv_days),
+  "Weekend days, n (%)" = n_pct(n_weekend, pct_weekend),
+  "Diary days, N" = format(diary_days, big.mark = ","),
+  "Days missing sleep, n (%)" = n_pct(n_missing_sleep, pct_missing_sleep),
+  "Days missing TV, n (%)" = n_pct(n_missing_tv, pct_missing_tv),
+  "Day-pairs with sleep (Models 1a-2a)" = format(pairs_sleep, big.mark = ","),
+  "Day-pairs with sleep and TV (Model 2b)" = format(pairs_sleep_tv, big.mark = ","),
+  "Complete pairs per participant, M (Mdn)" =
+    paste0(f2(pairs_per_person_mean), " (", pairs_per_person_median, ")")
+))
+
+table_x %>%
+  tidyr::pivot_longer(-sample, names_to = "Statistic") %>%
+  tidyr::pivot_wider(names_from = sample) %>%
+  knitr::kable()
+```
+
+# Model 3 panel sample (reported in text)
+
+Participants in the full-time, standard-shift samples at both MIDUS 2
+and MIDUS 3. Days are those with a next-night sleep report (the rows
+used by Models 3a and 3b).
+
+```{r}
+panel_ids <- intersect(samples[["MIDUS 2"]]$id, samples[["MIDUS 3"]]$id)
+
+panel <- bind_rows(samples[c("MIDUS 2", "MIDUS 3")], .id = "wave") %>%
+  filter(id %in% panel_ids)
+
+panel_values <- panel %>%
+  group_by(wave) %>%
+  summarise(
+    participants = n_distinct(id),
+    age_mean = mean(age[!duplicated(id)]),
+    age_sd = sd(age[!duplicated(id)]),
+    n_women = sum(sex[!duplicated(id)] == 1),
+    pct_women = mean(sex[!duplicated(id)] == 1) * 100,
+    days_with_sleep = sum(!is.na(sleep_next_night_minutes))
+  )
+
+as.data.frame(panel_values)
+
+# Total days used by Models 3a and 3b
+sum(panel_values$days_with_sleep)
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```

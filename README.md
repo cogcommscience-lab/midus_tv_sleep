@@ -16,7 +16,9 @@ scripts/
 ├── midus_2/              MIDUS 2
 ├── midus_3/              MIDUS 3
 ├── midus_refresher/      MIDUS Refresher 1
-└── cross_wave/           analyses that combine waves
+├── cross_wave/           analyses that combine waves
+├── paper_tables/         values reported in the manuscript's tables
+└── paper_figures/        manuscript figures (script and figures/)
 ```
 
 Each script is an R Markdown file (`.Rmd`), posted alongside its knitted
@@ -26,6 +28,9 @@ anything. In each wave folder:
 - `*_data_structuring`: builds the analysis datasets from the ICPSR files.
 - `*_modeling_fulltime_standard`: the primary, preregistered analysis
   (full-time, standard-shift workers).
+
+The figure script is a plain R script (`paper_figures.R`); its outputs
+(PDF and PNG figures) are in `paper_figures/figures/`.
 
 Scripts are added as they are finalized.
 
@@ -58,11 +63,16 @@ Knit the scripts in R (models use `brms`). All paths are relative to each
 script's folder, so nothing needs editing.
 
 1. Knit each wave's `*_data_structuring.Rmd` first.
-2. Then knit that wave's modeling scripts.
+2. Then knit that wave's modeling scripts, and then the `cross_wave/`
+   scripts.
+3. Knit `paper_tables/paper_tables.Rmd` (needs only step 1).
+4. Run `paper_figures/paper_figures.R` from its folder
+   (`Rscript paper_figures.R`). It reads the fitted models from step 2.
 
 Fitted models are cached next to the scripts, so re-knitting reloads them
 instead of refitting. A first run of a modeling script can take several
-hours. R and package versions are listed at the end of each HTML.
+hours. R and package versions are listed at the end of each HTML (for the
+figures, in `paper_figures/figures/session_info.txt`).
 
 ## License
 
