@@ -1,0 +1,339 @@
+---
+title: "Model 4: Cross-Cohort TV-Sleep Comparisons"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# About this script
+
+**Preregistered analysis (main text; RQ4).** Joint models testing whether
+the within- and between-person associations between TV viewing and sleep
+differ across MIDUS samples: Model 4a compares MIDUS 2 and MIDUS 3 (the
+same cohort at a later wave); Model 4b compares MIDUS 2 and MIDUS
+Refresher 1 (a different cohort). Each is Model 2b plus wave/cohort
+intercepts and wave/cohort-specific TV effects, with the random intercept
+and random scale carried forward from Model 1b. Run the three structuring
+scripts first.
+
+Iterations were increased to meet the prereg ESS criterion (> 1000):
+Model 4a uses 16000 iterations (4000 warmup); Model 4b uses 8000 (4000
+warmup).
+
+# Packages, data, and helper functions
+
+```{r}
+library(dplyr)
+library(brms)
+
+M2_sample <- readRDS("../midus_2/M2_analysis_data_fulltime_standard.rds")
+M3_sample <- readRDS("../midus_3/M3_analysis_data_fulltime_standard.rds")
+MR_sample <- readRDS("../midus_refresher/MR_analysis_data_fulltime_standard.rds")
+
+model_output_dir <- "model_fits_cross_wave"
+dir.create(model_output_dir, showWarnings = FALSE, recursive = TRUE)
+
+# Prereg convergence criteria: R-hat < 1.01, bulk and tail ESS > 1000,
+# and 0 divergent transitions (population-level, SD, and correlation
+# parameters)
+check_convergence <- function(fit) {
+  draws_summary <- posterior::summarise_draws(
+    as_draws_df(fit, variable = "^(b_|sd_|cor_|sigma$)", regex = TRUE),
+    "rhat", "ess_bulk", "ess_tail"
+  )
+
+  tibble(
+    max_rhat = max(draws_summary$rhat, na.rm = TRUE),
+    min_bulk_ess = min(draws_summary$ess_bulk, na.rm = TRUE),
+    min_tail_ess = min(draws_summary$ess_tail, na.rm = TRUE),
+    divergent = sum(nuts_params(fit, pars = "divergent__")$Value)
+  ) %>%
+    mutate(
+      meets_prereg = max_rhat < 1.01 & min_bulk_ess > 1000 &
+        min_tail_ess > 1000 & divergent == 0
+    )
+}
+
+# Prereg assumption check: Q-Q plot of level-1 residuals
+check_residual_normality <- function(fit, label) {
+  resid_est <- residuals(
+    fit,
+    method = "posterior_predict"
+  )[, "Estimate"]
+
+  qqnorm(
+    resid_est,
+    main = paste0(label, ": Level-1 residual Q-Q plot")
+  )
+
+  qqline(resid_est)
+}
+
+# All samples are already restricted to full-time, standard shift
+stopifnot(
+  all(M2_sample$is_fulltime == 1), all(M2_sample$is_standard_shift == 1),
+  all(M3_sample$is_fulltime == 1), all(M3_sample$is_standard_shift == 1),
+  all(MR_sample$is_fulltime == 1), all(MR_sample$is_standard_shift == 1)
+)
+```
+
+# Preparing each wave's sample
+
+Within each wave, as in the single-wave models: age is mean-centered at
+the participant level, TV is person-mean centered (`tv_within`), and each
+person's TV mean is grand-mean centered across that wave's participants
+(`tv_person_mean`).
+
+```{r}
+prepare_wave_sample <- function(data) {
+
+  age_mean <- data %>%
+    distinct(id, age) %>%
+    summarise(m = mean(age, na.rm = TRUE)) %>%
+    pull(m)
+
+  data <- data %>%
+    mutate(
+      age_centered = age - age_mean
+    ) %>%
+    group_by(id) %>%
+    mutate(
+      tv_person_mean_raw = mean(tv_duration_minutes, na.rm = TRUE),
+      tv_within = tv_duration_minutes - tv_person_mean_raw
+    ) %>%
+    ungroup()
+
+  # Equally weighted mean of participants' TV means
+  tv_grand_mean <- data %>%
+    distinct(id, tv_person_mean_raw) %>%
+    summarise(m = mean(tv_person_mean_raw, na.rm = TRUE)) %>%
+    pull(m)
+
+  data %>%
+    mutate(tv_person_mean = tv_person_mean_raw - tv_grand_mean)
+}
+
+M2_prepared <- prepare_wave_sample(M2_sample)
+M3_prepared <- prepare_wave_sample(M3_sample)
+MR_prepared <- prepare_wave_sample(MR_sample)
+
+# QC: within-person deviations average ~0 per person; centered person
+# means average ~0 per wave
+bind_rows(
+  M2 = M2_prepared, M3 = M3_prepared, MR = MR_prepared,
+  .id = "wave"
+) %>%
+  group_by(wave, id) %>%
+  summarise(
+    mean_tv_within = mean(tv_within, na.rm = TRUE),
+    tv_person_mean = first(tv_person_mean),
+    .groups = "drop"
+  ) %>%
+  group_by(wave) %>%
+  summarise(
+    max_abs_mean_tv_within = max(abs(mean_tv_within), na.rm = TRUE),
+    mean_tv_person_mean = mean(tv_person_mean, na.rm = TRUE)
+  )
+```
+
+# Model 4a: MIDUS 2 and MIDUS 3
+
+The same participants can appear in both waves, so each person's
+wave-specific random intercepts and scales are allowed to correlate.
+
+```{r}
+data_4a <- bind_rows(
+  M2_prepared %>% mutate(wave = "MIDUS2"),
+  M3_prepared %>% mutate(wave = "MIDUS3")
+)
+
+data_4a$wave <- factor(
+  data_4a$wave,
+  levels = c("MIDUS2", "MIDUS3")
+)
+
+cat(
+  "Model 4a data:\n",
+  "MIDUS 2 participants:", n_distinct(data_4a$id[data_4a$wave == "MIDUS2"]), "\n",
+  "MIDUS 3 participants:", n_distinct(data_4a$id[data_4a$wave == "MIDUS3"]), "\n"
+)
+```
+
+```{r}
+bf_model_4a <- bf(
+  sleep_next_night_minutes ~
+    0 + wave +
+    weekend +
+    age_centered +
+    sex +
+    wave:tv_within +
+    wave:tv_person_mean +
+    (0 + wave | c | id),
+
+  sigma ~
+    0 + wave +
+    (0 + wave | c | id)
+)
+
+fit_4a <- brm(
+  bf_model_4a,
+  data = data_4a,
+  family = gaussian(),
+  chains = 4,
+  # Iterations increased per prereg (ESS criterion)
+  iter = 16000,
+  warmup = 4000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(model_output_dir, "model_4a_m2_m3"),
+  file_refit = "never"
+)
+
+summary(fit_4a, prob = 0.9)
+
+fixef(fit_4a, probs = c(0.05, 0.95))
+
+vc_4a <- VarCorr(fit_4a, probs = c(0.05, 0.95))
+vc_4a$id$cor[, "Estimate", ]
+```
+
+```{r}
+# Wave difference in average sleep (prereg beta_4; 90% credible interval).
+# Age is centered within each wave, so this compares each wave at its own
+# average age (and average TV)
+hypothesis(
+  fit_4a,
+  "waveMIDUS3 - waveMIDUS2 = 0",
+  alpha = 0.10
+)
+
+# Wave differences in the TV effects (90% credible intervals)
+hypothesis(
+  fit_4a,
+  "waveMIDUS3:tv_within - waveMIDUS2:tv_within = 0",
+  alpha = 0.10
+)
+
+hypothesis(
+  fit_4a,
+  "waveMIDUS3:tv_person_mean - waveMIDUS2:tv_person_mean = 0",
+  alpha = 0.10
+)
+```
+
+# Model 4b: MIDUS 2 and MIDUS Refresher 1
+
+Different people in each cohort, so each person has one random intercept
+and one random scale.
+
+```{r}
+data_4b <- bind_rows(
+  M2_prepared %>% mutate(cohort = "MIDUS2"),
+  MR_prepared %>% mutate(cohort = "MIDUSRefresher1")
+)
+
+data_4b$cohort <- factor(
+  data_4b$cohort,
+  levels = c("MIDUS2", "MIDUSRefresher1")
+)
+
+# QC: MIDUS 2 and Refresher IDs never overlap, so `id` identifies a
+# single person in the combined data
+stopifnot(length(intersect(M2_prepared$id, MR_prepared$id)) == 0)
+
+cat(
+  "Model 4b data:\n",
+  "MIDUS 2 participants:", n_distinct(data_4b$id[data_4b$cohort == "MIDUS2"]), "\n",
+  "MIDUS Refresher 1 participants:", n_distinct(data_4b$id[data_4b$cohort == "MIDUSRefresher1"]), "\n"
+)
+```
+
+```{r}
+bf_model_4b <- bf(
+  sleep_next_night_minutes ~
+    0 + cohort +
+    weekend +
+    age_centered +
+    sex +
+    cohort:tv_within +
+    cohort:tv_person_mean +
+    (1 | c | id),
+
+  sigma ~
+    0 + cohort +
+    (1 | c | id)
+)
+
+fit_4b <- brm(
+  bf_model_4b,
+  data = data_4b,
+  family = gaussian(),
+  chains = 4,
+  # Iterations increased per prereg (ESS criterion)
+  iter = 8000,
+  warmup = 4000,
+  seed = 2026,
+  save_pars = save_pars(all = TRUE),
+  file = file.path(model_output_dir, "model_4b_m2_mr"),
+  file_refit = "never"
+)
+
+summary(fit_4b, prob = 0.9)
+
+fixef(fit_4b, probs = c(0.05, 0.95))
+
+vc_4b <- VarCorr(fit_4b, probs = c(0.05, 0.95))
+vc_4b$id$cor[, "Estimate", ]
+```
+
+```{r}
+# Cohort difference in average sleep (prereg beta_4; 90% credible
+# interval). Age is centered within each cohort, so this compares each
+# cohort at its own average age (and average TV)
+hypothesis(
+  fit_4b,
+  "cohortMIDUSRefresher1 - cohortMIDUS2 = 0",
+  alpha = 0.10
+)
+
+# Cohort differences in the TV effects (90% credible intervals)
+hypothesis(
+  fit_4b,
+  "cohortMIDUSRefresher1:tv_within - cohortMIDUS2:tv_within = 0",
+  alpha = 0.10
+)
+
+hypothesis(
+  fit_4b,
+  "cohortMIDUSRefresher1:tv_person_mean - cohortMIDUS2:tv_person_mean = 0",
+  alpha = 0.10
+)
+```
+
+# Model diagnostics (prereg convergence and residual checks)
+
+```{r}
+models <- list(
+  fit_4a = fit_4a,
+  fit_4b = fit_4b
+)
+
+sapply(models, nobs)
+
+# Convergence: every row should show meets_prereg = TRUE
+bind_rows(lapply(models, check_convergence), .id = "model")
+```
+
+```{r}
+for (model_name in names(models)) {
+  check_residual_normality(models[[model_name]], model_name)
+}
+```
+
+# Session info
+
+```{r}
+sessionInfo()
+```
