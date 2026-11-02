@@ -547,8 +547,8 @@ make_figure2 <- function() {
     scale_x_continuous(expand = expansion(mult = 0.01)) +
     scale_y_continuous(limits = c(0, NA), expand = expansion(mult = c(0, 0.03))) +
     labs(
-      x = "Participant rank (by posterior mean residual SD, within sample)",
-      y = "Residual sleep SD (minutes)"
+      x = "Participant rank (by posterior mean day-to-day sleep variability, within sample)",
+      y = "Day-to-day sleep variability\n(residual SD, minutes)"
     ) +
     theme_manuscript() +
     theme(strip.text = element_text(hjust = 0))
